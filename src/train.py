@@ -1,141 +1,89 @@
-import torch
-import torch.nn as nn
-from transformers import GPT2LMHeadModel, GPT2Config, Trainer, TrainingArguments
-from tqdm import tqdm
 import os
-import sys
-from audio_tokenizers import get_acoustic_tokens, get_semantic_tokens
-from datasets import Dataset
-import torchaudio
+import torch
+import numpy as np
+from torch.utils.data import Dataset
 
+class AudioTokenDataset(Dataset):
+    def __init__(self, token_dir, context_len=128):
+        self.token_dir = token_dir
+        self.context_len = context_len
 
-DATA_DIR = "../test-clean-reduced"
+        self.samples = []
+        for name in os.listdir(token_dir):
+            if name.endswith("_semantic.npy"):
+                base = name.replace("_semantic.npy", "")
+                sem_path = os.path.join(token_dir, f"{base}_semantic.npy")
+                ac_path = os.path.join(token_dir, f"{base}_acoustic.npy")
+                if os.path.exists(sem_path) and os.path.exists(ac_path):
+                    self.samples.append((sem_path, ac_path))
 
-device = ("cuda" if torch.cuda.is_available() else "cpu")
+    def __len__(self):
+        return len(self.samples)
 
-# 1. Model Configuration
-config = GPT2Config(
-    vocab_size=1024,  # Semantic tokens vocabulary size
-    n_positions=512,
-    n_embd=256,
-    n_layer=4,
-    n_head=4,
-    pad_token_id=0,
-    add_cross_attention=True
-)
+    def __getitem__(self, idx):
+        sem_path, ac_path = self.samples[idx]
+        semantic = np.load(sem_path)
+        acoustic = np.load(ac_path)
 
-# 2. Custom Model Class
-class AudioGPT(GPT2LMHeadModel):
-    def __init__(self, config):
-        super().__init__(config)
-        # Additional projection layer to match acoustic token dimensions
-        self.acoustic_proj = nn.Linear(config.n_embd, 8)  # 8 codebooks
-        
-    def forward(self, input_ids, labels=None, **kwargs):
-        outputs = super().forward(
-            input_ids=input_ids,
-            attention_mask=kwargs.get('attention_mask'),
-            **kwargs
-        )
-        
-        # Project hidden states to acoustic token space
-        hidden_states = outputs[0]  # [batch_size, seq_len, n_embd]
-        logits = self.acoustic_proj(hidden_states)  # [batch_size, seq_len, 8]
-        
-        # Reshape for cross entropy
-        batch_size, seq_len, _ = logits.shape
-        logits = logits.reshape(batch_size * seq_len, -1)  # [batch*seq, 8]
-        
-        loss = None
-        if labels is not None:
-            # Flatten labels and ignore padding (-100)
-            labels = labels.reshape(-1)  # [batch*seq]
-            loss = nn.functional.cross_entropy(
-                logits,
-                labels,
-                ignore_index=-100
-            )
-        
-        return (loss, logits) if loss is not None else logits
+        # Cortamos o rellenamos para tener secuencias fijas
+        if len(semantic) >= self.context_len:
+            semantic = semantic[:self.context_len]
+        else:
+            semantic = np.pad(semantic, (0, self.context_len - len(semantic)))
 
-# 3. Initialize Model
-model = AudioGPT(config).to(device)
+        acoustic = acoustic.reshape(-1)  # Aplanar códigos EnCodec
+        if len(acoustic) >= self.context_len:
+            acoustic = acoustic[:self.context_len]
+        else:
+            acoustic = np.pad(acoustic, (0, self.context_len - len(acoustic)))
 
-# 4. Data Preparation (Modified)
-def prepare_dataset(data_dir):
-    semantic_sequences = []
-    acoustic_sequences = []
-    
-    for file in tqdm(os.listdir(data_dir)):
-        if file.endswith(".flac"):
-            path = os.path.join(data_dir, file)
-            waveform, sr = torchaudio.load(path)
-            
-            sem_tokens = get_semantic_tokens(waveform, sr)
-            ac_tokens = get_acoustic_tokens(waveform, sr)
-            
-            # Ensure sequences are not too long
-            sem_tokens = sem_tokens[:config.n_positions]
-            ac_tokens = ac_tokens[:, :config.n_positions]
-            
-            # Transpose acoustic tokens to [seq_len, num_codebooks]
-            acoustic_seq = ac_tokens.T  # Now [seq_len, 8]
-            
-            semantic_sequences.append(sem_tokens)
-            acoustic_sequences.append(acoustic_seq)
-    
-    return semantic_sequences, acoustic_sequences
-
-# 5. Custom Collator (Updated)
-class AudioCollator:
-    def __call__(self, batch):
-        input_ids = [torch.tensor(item["input_ids"]) for item in batch]
-        labels = [torch.tensor(item["labels"]) for item in batch]
-        
-        # Pad input_ids (semantic tokens)
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=0
-        )
-        
-        # Pad labels (acoustic tokens) and stack codebooks
-        max_len = max(l.shape[0] for l in labels)
-        padded_labels = torch.full(
-            (len(labels), max_len, 8), -100, dtype=torch.long
-        )
-        for i, l in enumerate(labels):
-            padded_labels[i, :l.shape[0]] = l
-        
         return {
-            "input_ids": input_ids,
-            "labels": padded_labels,
-            "attention_mask": (input_ids != 0).int()
+            "input_ids": torch.tensor(semantic, dtype=torch.long),
+            "labels": torch.tensor(acoustic, dtype=torch.long),
         }
 
-# 6. Training Setup
-semantic, acoustic = prepare_dataset(DATA_DIR)
+import torch.nn as nn
 
-dataset = Dataset.from_dict({
-    "input_ids": semantic,
-    "labels": acoustic
-})
+class MiniAudioLM(nn.Module):
+    def __init__(self, vocab_size=1024, d_model=512, nhead=8, num_layers=6, context_len=128):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoding = nn.Parameter(torch.randn(1, context_len, d_model))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc_out = nn.Linear(d_model, vocab_size)
 
-training_args = TrainingArguments(
-    output_dir="./audio_gpt",
-    overwrite_output_dir=True,
-    num_train_epochs=3,
-    per_device_train_batch_size=4,
-    save_steps=1000,
-    logging_steps=100,
-    report_to="none",
-    prediction_loss_only=True,
-    gradient_accumulation_steps=2
-)
+    def forward(self, x):
+        x = self.embedding(x) + self.pos_encoding[:, :x.size(1), :]
+        x = self.transformer(x)
+        return self.fc_out(x)
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=dataset,
-    data_collator=AudioCollator(),
-)
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from tqdm import tqdm
 
-trainer.train()
+dataset = AudioTokenDataset("tokens/", context_len=128)
+loader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+model = MiniAudioLM(vocab_size=1024).to("cuda")
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+for epoch in range(10):
+    model.train()
+    pbar = tqdm(loader, desc=f"Epoch {epoch}")
+    for batch in pbar:
+        x = batch["input_ids"].to("cuda")
+        y = batch["labels"].to("cuda")
+
+        logits = model(x)
+        loss = F.cross_entropy(logits.view(-1, 1024), y.view(-1))
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        pbar.set_postfix(loss=loss.item())
+
+torch.save(model.state_dict(), "mini_audiolm.pth")
+print("✅ Modelo guardado como mini_audiolm.pth")
+
